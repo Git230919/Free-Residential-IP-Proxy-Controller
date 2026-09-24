@@ -255,6 +255,9 @@ WEB_PASS = "${WEB_PASS}"
 dynamic_slot_map = {0: "JP"}
 control_mode = "auto"
 manual_node_ip = ""
+youtube_check_enabled = False
+config_fetch_interval = 15
+heartbeat_interval = 30
 pool = {0: {"process": None, "ip": "", "country": "", "connected_at": 0, "connecting": False}}
 pool_lock = threading.Lock()
 public_ip = ""
@@ -391,7 +394,7 @@ def fetch_config():
         return json.loads(res.read().decode("utf-8"))
 
 def apply_config(data):
-    global dynamic_slot_map, last_switch_timestamps, BASE_PROXY_PORT, control_mode, manual_node_ip
+    global dynamic_slot_map, last_switch_timestamps, BASE_PROXY_PORT, control_mode, manual_node_ip, youtube_check_enabled, config_fetch_interval, heartbeat_interval
     if "proxy_port" in data:
         new_port = int(data["proxy_port"])
         if 1 <= new_port <= 65535 and new_port != BASE_PROXY_PORT:
@@ -403,6 +406,9 @@ def apply_config(data):
     mode_changed = new_mode != control_mode or (new_mode == "manual" and new_manual_node_ip != manual_node_ip)
     control_mode = new_mode
     manual_node_ip = new_manual_node_ip
+    youtube_check_enabled = data.get("youtube_check", False) is True
+    config_fetch_interval = max(5, min(3600, int(data.get("config_fetch_interval", 15))))
+    heartbeat_interval = max(10, min(3600, int(data.get("heartbeat_interval", 30))))
     if "slot_map" in data:
         new_map = {int(k): str(v).upper() for k, v in data.get("slot_map", {}).items()}
         force_switch = {int(k): int(v) for k, v in data.get("force_switch", {}).items()}
@@ -435,7 +441,7 @@ def update_config_loop():
         try:
             apply_config(fetch_config())
         except: pass
-        time.sleep(15)
+        time.sleep(config_fetch_interval)
 
 def c2_heartbeat_loop():
     if not public_ip or public_ip == "Unknown_IP": get_public_ip()
@@ -445,7 +451,7 @@ def c2_heartbeat_loop():
         urllib.request.urlopen(req, timeout=10)
     except: pass
     while True:
-        time.sleep(30)
+        time.sleep(heartbeat_interval)
         if not public_ip or public_ip == "Unknown_IP": get_public_ip()
         details = []
         with pool_lock:
@@ -459,7 +465,7 @@ def c2_heartbeat_loop():
         with reservoir_lock:
             candidates = [{"ip": n["ip"], "country": n["country"], "ping": n.get("ping", 9999)} for n in global_node_reservoir.values() if n.get("ip") and not is_ip_blacklisted(n["ip"])]
         candidates.sort(key=lambda n: n["ping"])
-        payload = json.dumps({"ip": public_ip, "details": details, "log": read_recent_logs(), "candidates": candidates[:100]}).encode('utf-8')
+        payload = json.dumps({"ip": public_ip, "details": details, "log": read_recent_logs(), "candidates": candidates[:500]}).encode('utf-8')
         try:
             req = urllib.request.Request(f"{C2_URL}/api/report", data=payload, headers=get_c2_headers(), method='POST')
             urllib.request.urlopen(req, timeout=10)
@@ -561,15 +567,16 @@ def connect_slot(slot: int, node: dict):
 
             setup_routing(slot)
             
-            print(f"[*] 单端口 ({node['country']}) 核验通过，执行 YouTube 业务连通性测试...", flush=True)
             services_passed = True
-            test_urls = ["https://www.youtube.com"]
-            for test_url in test_urls:
-                res = subprocess.run(["curl", "-s", "-I", "-m", "15", "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "--interface", f"tun{slot}", test_url], capture_output=True)
-                if res.returncode != 0:
-                    print(f"[-] 单端口 ({node['country']}) 访问 {test_url} 阻断/超时，临时冷却: {node['ip']}", flush=True)
-                    services_passed = False
-                    break
+            if youtube_check_enabled:
+                print(f"[*] 单端口 ({node['country']}) 核验通过，执行 YouTube 业务连通性测试...", flush=True)
+                test_urls = ["https://www.youtube.com"]
+                for test_url in test_urls:
+                    res = subprocess.run(["curl", "-s", "-I", "-m", "15", "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "--interface", f"tun{slot}", test_url], capture_output=True)
+                    if res.returncode != 0:
+                        print(f"[-] 单端口 ({node['country']}) 访问 {test_url} 阻断/超时，临时冷却: {node['ip']}", flush=True)
+                        services_passed = False
+                        break
             
             if not services_passed:
                 try: process.terminate(); process.wait(timeout=2)
@@ -829,12 +836,16 @@ echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌�
     }
 
     if (url.pathname === "/api/config" && request.method === "GET") {
-        const { results } = await env.DB.prepare(`SELECT key, value FROM global_config WHERE key IN ('slot_map', 'force_switch', 'proxy_port', 'mode', 'manual_node_ip')`).all();
+        const { results } = await env.DB.prepare(`SELECT key, value FROM global_config WHERE key IN ('slot_map', 'force_switch', 'proxy_port', 'mode', 'manual_node_ip', 'youtube_check', 'config_fetch_interval', 'heartbeat_interval', 'frontend_poll_interval')`).all();
         let slot_map = {0: "JP"};
         let force_switch = {};
         let proxy_port = PROXY_PORT;
         let mode = 'auto';
         let manual_node_ip = '';
+        let youtube_check = false;
+        let config_fetch_interval = 15;
+        let heartbeat_interval = 30;
+        let frontend_poll_interval = 5;
         if (results) {
             for (let row of results) {
                 if (row.key === 'slot_map') slot_map = JSON.parse(row.value);
@@ -842,9 +853,13 @@ echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌�
                 if (row.key === 'proxy_port') proxy_port = parseInt(row.value, 10);
                 if (row.key === 'mode') mode = row.value === 'manual' ? 'manual' : 'auto';
                 if (row.key === 'manual_node_ip') manual_node_ip = row.value;
+                if (row.key === 'youtube_check') youtube_check = row.value === 'true';
+                if (row.key === 'config_fetch_interval') config_fetch_interval = Math.max(5, Math.min(3600, parseInt(row.value, 10) || 15));
+                if (row.key === 'heartbeat_interval') heartbeat_interval = Math.max(10, Math.min(3600, parseInt(row.value, 10) || 30));
+                if (row.key === 'frontend_poll_interval') frontend_poll_interval = Math.max(5, Math.min(300, parseInt(row.value, 10) || 5));
             }
         }
-        return new Response(JSON.stringify({slot_map, force_switch, proxy_port, mode, manual_node_ip}), { headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({slot_map, force_switch, proxy_port, mode, manual_node_ip, youtube_check, config_fetch_interval, heartbeat_interval, frontend_poll_interval}), { headers: { "Content-Type": "application/json" } });
     }
 
     if (url.pathname === "/api/config" && request.method === "POST") {
@@ -856,6 +871,10 @@ echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌�
         const slotMap = data.slot_map || data;
         const mode = data.mode === 'manual' ? 'manual' : 'auto';
         const manualNodeIp = typeof data.manual_node_ip === 'string' ? data.manual_node_ip.trim() : '';
+        const youtubeCheck = data.youtube_check === true;
+        const configFetchInterval = Math.max(5, Math.min(3600, Number.parseInt(data.config_fetch_interval, 10) || 15));
+        const heartbeatInterval = Math.max(10, Math.min(3600, Number.parseInt(data.heartbeat_interval, 10) || 30));
+        const frontendPollInterval = Math.max(5, Math.min(300, Number.parseInt(data.frontend_poll_interval, 10) || 5));
         await env.DB.prepare(`
             INSERT INTO global_config (key, value) VALUES ('slot_map', ?1)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -872,6 +891,16 @@ echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌�
             INSERT INTO global_config (key, value) VALUES ('manual_node_ip', ?1)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
         `).bind(manualNodeIp).run();
+        await env.DB.prepare(`
+            INSERT INTO global_config (key, value) VALUES ('youtube_check', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `).bind(String(youtubeCheck)).run();
+        for (const [key, value] of [['config_fetch_interval', configFetchInterval], ['heartbeat_interval', heartbeatInterval], ['frontend_poll_interval', frontendPollInterval]]) {
+          await env.DB.prepare(`
+              INSERT INTO global_config (key, value) VALUES (?1, ?2)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value
+          `).bind(key, String(value)).run();
+        }
         return new Response("OK");
     }
 
@@ -895,7 +924,7 @@ echo "[+] 智能时效隔离版本部署成功！稳定机房节点免死金牌�
         await env.DB.prepare(`
           INSERT INTO servers (ip, details, log, candidates, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)
           ON CONFLICT(ip) DO UPDATE SET details = excluded.details, log = excluded.log, candidates = excluded.candidates, last_seen = excluded.last_seen
-        `).bind(data.ip, JSON.stringify(data.details || []), String(data.log || '').slice(-12000), JSON.stringify(data.candidates || []).slice(0, 20000), Date.now()).run();
+        `).bind(data.ip, JSON.stringify(data.details || []), String(data.log || '').slice(-12000), JSON.stringify(data.candidates || []).slice(0, 100000), Date.now()).run();
         return new Response("OK", { status: 200 });
       } catch (err) { return new Response("Error", { status: 500 }); }
     }
@@ -1022,10 +1051,8 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
                 </div>
                 <div class="text-[10px] text-green-400 font-mono animate-pulse">● 实时直播</div>
             </div>
-             <div id="mock-terminal" class="p-3 font-mono text-xs overflow-y-auto flex-grow custom-scrollbar leading-relaxed">
-                 <span class="text-blue-400">免费住宅IP智能调度系统网络初始化完毕... 正在等待各节点心跳回传...</span><br>
-             </div>
-             <pre id="remote-log" class="hidden absolute inset-8 overflow-y-auto bg-black p-3 text-xs text-green-300 whitespace-pre-wrap custom-scrollbar"></pre>
+             <div id="mock-terminal" class="hidden"></div>
+             <pre id="remote-log" class="hidden p-4 overflow-y-auto flex-grow bg-black/40 text-xs text-green-300 whitespace-pre-wrap custom-scrollbar"></pre>
         </div>
     </div>
 
@@ -1046,6 +1073,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
         const terminalLogs = [];
         function pushLog(msg, type="INFO") {
             const term = document.getElementById('mock-terminal');
+            if (!term) return;
             const now = new Date();
             const timeStr = now.getHours().toString().padStart(2, '0') + ':' + 
                             now.getMinutes().toString().padStart(2, '0') + ':' + 
@@ -1116,6 +1144,22 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
                             <label for="proxy-port" class="text-[12px] text-gray-400 text-left">代理监听端口</label>
                             <input type="number" id="proxy-port" value="\${port}" min="1" max="65535" step="1" required class="bg-gray-800 border border-gray-600 rounded p-2 text-white text-center font-bold text-xl focus:outline-none focus:border-blue-400 transition w-full" />
                         </div>
+                        <label class="flex items-center gap-3 px-3 py-2 rounded-xl bg-slate-800/70 border border-white/10 cursor-pointer select-none">
+                            <input type="checkbox" id="youtube-check" \${map_data.youtube_check ? 'checked' : ''} class="w-4 h-4 accent-cyan-400" />
+                            <span><strong class="block text-sm text-slate-200">YouTube 可用检测</strong><small class="text-[11px] text-slate-500">默认关闭，减少连接耗时</small></span>
+                        </label>
+                        <div class="flex flex-col gap-2 w-40">
+                            <label for="config-fetch-interval" class="text-[12px] text-gray-400 text-left">Agent 拉配置间隔（秒）</label>
+                            <input type="number" id="config-fetch-interval" value="\${map_data.config_fetch_interval || 15}" min="5" max="3600" step="1" class="bg-gray-800 border border-gray-600 rounded p-2 text-white text-center font-bold focus:outline-none focus:border-blue-400 transition w-full" />
+                        </div>
+                        <div class="flex flex-col gap-2 w-40">
+                            <label for="heartbeat-interval" class="text-[12px] text-gray-400 text-left">Agent 心跳间隔（秒）</label>
+                            <input type="number" id="heartbeat-interval" value="\${map_data.heartbeat_interval || 30}" min="10" max="3600" step="1" class="bg-gray-800 border border-gray-600 rounded p-2 text-white text-center font-bold focus:outline-none focus:border-blue-400 transition w-full" />
+                        </div>
+                        <div class="flex flex-col gap-2 w-40">
+                            <label for="frontend-poll-interval" class="text-[12px] text-gray-400 text-left">面板轮询间隔（秒）</label>
+                            <input type="number" id="frontend-poll-interval" value="\${map_data.frontend_poll_interval || 5}" min="5" max="300" step="1" class="bg-gray-800 border border-gray-600 rounded p-2 text-white text-center font-bold focus:outline-none focus:border-blue-400 transition w-full" />
+                        </div>
                         <div class="flex flex-col bg-gray-900 border-l border-gray-700 pl-4 text-center relative group w-48">
                             <div class="flex justify-between items-center px-1 mb-2">
                                 <label class="text-[12px] text-gray-400">当前区域策略</label>
@@ -1153,7 +1197,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
                     if (!candidates.some(item => item.ip === node.ip)) candidates.push(node);
                 });
             });
-            candidates.sort((a, b) => (a.ping || 9999) - (b.ping || 9999));
+            candidates.sort((a, b) => (a.ping || 9999) - (b.ping || 9999) || String(a.country || '').localeCompare(String(b.country || '')) || String(a.ip).localeCompare(String(b.ip)));
             select.innerHTML = '<option value="">请选择可用节点</option>' + candidates.map(node =>
                 \`<option value="\${node.ip}">\${node.country || '--'} | \${node.ip} | \${node.ping || '?'} ms</option>\`
             ).join('');
@@ -1191,6 +1235,14 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
             };
             const mode = document.getElementById('control-mode').value;
             const manualNodeIp = document.getElementById('manual-node').value;
+            const youtubeCheck = document.getElementById('youtube-check').checked;
+            const configFetchInterval = Number.parseInt(document.getElementById('config-fetch-interval').value, 10);
+            const heartbeatInterval = Number.parseInt(document.getElementById('heartbeat-interval').value, 10);
+            const frontendPollInterval = Number.parseInt(document.getElementById('frontend-poll-interval').value, 10);
+            if (!Number.isInteger(configFetchInterval) || configFetchInterval < 5 || configFetchInterval > 3600 || !Number.isInteger(heartbeatInterval) || heartbeatInterval < 10 || heartbeatInterval > 3600 || !Number.isInteger(frontendPollInterval) || frontendPollInterval < 5 || frontendPollInterval > 300) {
+                alert('间隔设置不合法：配置拉取 5-3600 秒，心跳 10-3600 秒，面板轮询 5-300 秒');
+                return;
+            }
             if (mode === 'manual' && !manualNodeIp) {
                 alert('手动模式必须先选择一个可用节点');
                 return;
@@ -1198,7 +1250,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
             const res = await fetch('/api/config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({slot_map: map, proxy_port: port, mode, manual_node_ip: manualNodeIp})
+                body: JSON.stringify({slot_map: map, proxy_port: port, mode, manual_node_ip: manualNodeIp, youtube_check: youtubeCheck, config_fetch_interval: configFetchInterval, heartbeat_interval: heartbeatInterval, frontend_poll_interval: frontendPollInterval})
             });
             if (!res.ok) {
                 alert('配置保存失败，请检查端口范围后重试');
@@ -1207,6 +1259,13 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
             pushLog('[控制中心广播] 国家路由策略已更新至节点。', 'SYS');
             alert(\`配置已下发，代理端口将切换为 \${port}。\`);
             loadConfig();
+            restartNodePolling(frontendPollInterval);
+        }
+
+        let nodePollingTimer;
+        function restartNodePolling(seconds) {
+            if (nodePollingTimer) clearInterval(nodePollingTimer);
+            nodePollingTimer = setInterval(fetchNodes, seconds * 1000);
         }
 
         async function fetchNodes() {
@@ -1268,7 +1327,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass, proxyPor
         fetchCountries();
         loadConfig();
         fetchNodes();
-        setInterval(fetchNodes, 5000);
+        fetch('/api/config').then(res => res.json()).then(config => restartNodePolling(config.frontend_poll_interval || 5)).catch(() => restartNodePolling(5));
     </script>
 </body>
 </html>
